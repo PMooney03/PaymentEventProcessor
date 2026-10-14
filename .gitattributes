@@ -1,0 +1,5 @@
+# Normalise line endings to LF so gofmt checks and shell scripts behave
+# identically on Windows, macOS, Linux and in CI.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
