@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # One-shot job: applies pending migrations then exits. The API waits for it
+  # to complete successfully, so schema management never happens inside the
+  # application process.
+  migrate:
+    build: .
+    entrypoint: ["/app/migrate", "up"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/payments?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/payments?sslmode=disable
+      PORT: "8080"
+      LOG_LEVEL: info
+      MAX_RETRIES: "3"
+      RETRY_BASE_DELAY: 1s
+      WORKER_INTERVAL: 1s
+      WORKER_CONCURRENCY: "2"
+      FAILURE_RATE: "0.3"
+      WEBHOOK_TIMEOUT: 5s
+      WEBHOOK_MAX_RETRIES: "5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:
