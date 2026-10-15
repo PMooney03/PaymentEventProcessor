@@ -176,6 +176,31 @@ func (s *Store) ScheduleRetry(ctx context.Context, id uuid.UUID, nextAttemptAt t
 		WHERE id = $1 AND status = 'processing'`, nextAttemptAt, reason)
 }
 
+// Release returns a processing event to the queue immediately without
+// counting a retry. Used when a worker is shutting down mid-attempt.
+func (s *Store) Release(ctx context.Context, id uuid.UUID) error {
+	return s.transition(ctx, s.pool, id, `
+		UPDATE events
+		SET status = 'pending', next_attempt_at = now(), updated_at = now()
+		WHERE id = $1 AND status = 'processing'`)
+}
+
+// ReclaimStale returns events that have been 'processing' for longer than
+// olderThan back to 'pending'. This recovers rows orphaned by a worker that
+// crashed between claiming and finishing. It returns how many were reclaimed.
+func (s *Store) ReclaimStale(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE events
+		SET status = 'pending', next_attempt_at = now(), updated_at = now(),
+		    last_error = 'reclaimed: worker did not finish processing'
+		WHERE status = 'processing' AND updated_at < now() - $1::interval`,
+		olderThan)
+	if err != nil {
+		return 0, fmt.Errorf("reclaim stale events: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // MarkFailed finalises a processing event as permanently failed.
 func (s *Store) MarkFailed(ctx context.Context, id uuid.UUID, reason string) error {
 	return s.transition(ctx, s.pool, id, `
