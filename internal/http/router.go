@@ -7,9 +7,10 @@ import (
 
 // Deps are the collaborators the router needs.
 type Deps struct {
-	Logger *slog.Logger
-	Events EventService
-	DB     Pinger
+	Logger   *slog.Logger
+	Events   EventService
+	Webhooks WebhookService
+	DB       Pinger
 }
 
 // NewHandler builds the fully wired HTTP handler.
@@ -24,6 +25,12 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/events", eh.create)
 	mux.HandleFunc("GET /api/events", eh.list)
 	mux.HandleFunc("GET /api/events/{id}", eh.get)
+
+	wh := &webhooksHandler{svc: d.Webhooks}
+	mux.HandleFunc("POST /api/webhooks", wh.create)
+	mux.HandleFunc("GET /api/webhooks", wh.list)
+	mux.HandleFunc("DELETE /api/webhooks/{id}", wh.remove)
+	mux.HandleFunc("GET /api/events/{id}/webhook-attempts", wh.attemptsForEvent)
 
 	return chain(jsonFallback(mux),
 		requestID(d.Logger),

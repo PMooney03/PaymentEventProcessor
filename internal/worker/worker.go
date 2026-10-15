@@ -15,6 +15,7 @@ import (
 
 	"github.com/PMooney03/payment-event-processor/internal/database"
 	"github.com/PMooney03/payment-event-processor/internal/events"
+	"github.com/PMooney03/payment-event-processor/internal/retry"
 )
 
 // Processor performs the downstream work for a claimed event. A nil return
@@ -152,7 +153,7 @@ func (w *Worker) ProcessOne(ctx context.Context, log *slog.Logger) (bool, error)
 		log.Warn("event released during shutdown", "duration_ms", ms(elapsed))
 
 	case e.RetryCount < w.cfg.MaxRetries:
-		delay := Backoff(w.cfg.RetryBaseDelay, e.RetryCount)
+		delay := retry.Backoff(w.cfg.RetryBaseDelay, e.RetryCount)
 		if err := w.store.ScheduleRetry(fctx, e.ID, time.Now().Add(delay), perr.Error()); err != nil {
 			return true, err
 		}

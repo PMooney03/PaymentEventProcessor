@@ -1,4 +1,6 @@
-package worker
+// Package retry holds the backoff schedule shared by the event worker and the
+// webhook dispatcher.
+package retry
 
 import "time"
 

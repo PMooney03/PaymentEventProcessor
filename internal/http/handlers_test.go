@@ -16,6 +16,7 @@ import (
 	"github.com/PMooney03/payment-event-processor/internal/events"
 	"github.com/PMooney03/payment-event-processor/internal/idempotency"
 	"github.com/PMooney03/payment-event-processor/internal/logging"
+	"github.com/PMooney03/payment-event-processor/internal/webhook"
 )
 
 // fakeEvents is an in-memory EventService.
@@ -116,9 +117,57 @@ type okPinger struct{ err error }
 
 func (p okPinger) Ping(context.Context) error { return p.err }
 
+// fakeWebhooks is an in-memory WebhookService.
+type fakeWebhooks struct {
+	mu        sync.Mutex
+	endpoints []webhook.Endpoint
+	attempts  map[uuid.UUID][]webhook.Attempt
+}
+
+func newFakeWebhooks() *fakeWebhooks {
+	return &fakeWebhooks{attempts: map[uuid.UUID][]webhook.Attempt{}}
+}
+
+func (f *fakeWebhooks) CreateEndpoint(_ context.Context, in webhook.EndpointInput) (*webhook.Endpoint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ep := webhook.Endpoint{ID: uuid.New(), URL: in.URL, HasSecret: in.Secret != "", Active: true, CreatedAt: time.Now()}
+	f.endpoints = append(f.endpoints, ep)
+	return &ep, nil
+}
+
+func (f *fakeWebhooks) ListEndpoints(context.Context) ([]webhook.Endpoint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]webhook.Endpoint{}, f.endpoints...), nil
+}
+
+func (f *fakeWebhooks) DeleteEndpoint(_ context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, ep := range f.endpoints {
+		if ep.ID == id {
+			f.endpoints = append(f.endpoints[:i], f.endpoints[i+1:]...)
+			return nil
+		}
+	}
+	return webhook.ErrEndpointNotFound
+}
+
+func (f *fakeWebhooks) ListAttemptsForEvent(_ context.Context, id uuid.UUID) ([]webhook.Attempt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]webhook.Attempt{}, f.attempts[id]...), nil
+}
+
 func newTestServer(t *testing.T, svc EventService, db Pinger) *httptest.Server {
 	t.Helper()
-	h := NewHandler(Deps{Logger: logging.Discard(), Events: svc, DB: db})
+	return newTestServerWith(t, svc, newFakeWebhooks(), db)
+}
+
+func newTestServerWith(t *testing.T, svc EventService, wh WebhookService, db Pinger) *httptest.Server {
+	t.Helper()
+	h := NewHandler(Deps{Logger: logging.Discard(), Events: svc, Webhooks: wh, DB: db})
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv

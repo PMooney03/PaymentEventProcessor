@@ -11,12 +11,15 @@ run: ## Run the API locally (expects a reachable Postgres)
 migrate: ## Apply migrations against DATABASE_URL
 	go run ./cmd/migrate up
 
-test: ## Run unit tests with the race detector
+test: ## Run unit tests with the race detector (DB tests are skipped)
 	go test -race -count=1 ./...
 
-test-integration: ## Run all tests including DB integration (needs TEST_DATABASE_URL)
+# Integration tests share one database, so packages must not run in parallel
+# (-p 1). Use the dedicated payments_test database created by docker compose
+# so the running application's worker never interferes.
+test-integration: ## Run all tests including DB integration
 	TEST_DATABASE_URL=$${TEST_DATABASE_URL:-postgres://postgres:postgres@localhost:5432/payments_test?sslmode=disable} \
-		go test -race -count=1 ./...
+		go test -race -count=1 -p 1 ./...
 
 vet:
 	go vet ./...

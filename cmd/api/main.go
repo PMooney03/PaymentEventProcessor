@@ -18,10 +18,16 @@ import (
 	"github.com/PMooney03/payment-event-processor/internal/events"
 	apihttp "github.com/PMooney03/payment-event-processor/internal/http"
 	"github.com/PMooney03/payment-event-processor/internal/logging"
+	"github.com/PMooney03/payment-event-processor/internal/webhook"
 	"github.com/PMooney03/payment-event-processor/internal/worker"
 )
 
-const shutdownTimeout = 15 * time.Second
+const (
+	shutdownTimeout = 15 * time.Second
+	// staleAfter is how long a claimed event or webhook attempt may sit
+	// in-flight before a crashed worker is assumed and it is re-queued.
+	staleAfter = 5 * time.Minute
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -49,30 +55,50 @@ func run() error {
 	logger.Info("database connected")
 
 	eventSvc := events.NewService(pool)
+	webhookStore := webhook.NewStore(pool)
 
 	// Background worker: simulated downstream with configurable flakiness.
+	// On success it enqueues webhook deliveries in the same transaction.
 	wrk := worker.New(worker.Config{
 		Concurrency:    cfg.WorkerConcurrency,
 		PollInterval:   cfg.WorkerInterval,
 		MaxRetries:     cfg.MaxRetries,
 		RetryBaseDelay: cfg.RetryBaseDelay,
-		StaleAfter:     5 * time.Minute,
-	}, pool, worker.Simulated(cfg.FailureRate, 50*time.Millisecond, 250*time.Millisecond), nil, logger)
+		StaleAfter:     staleAfter,
+	}, pool,
+		worker.Simulated(cfg.FailureRate, 50*time.Millisecond, 250*time.Millisecond),
+		webhook.SuccessHook(webhookStore),
+		logger)
+
+	dispatcher := webhook.NewDispatcher(webhook.Config{
+		Concurrency:    cfg.WorkerConcurrency,
+		PollInterval:   cfg.WorkerInterval,
+		Timeout:        cfg.WebhookTimeout,
+		MaxRetries:     cfg.WebhookMaxRetries,
+		RetryBaseDelay: cfg.RetryBaseDelay,
+		StaleAfter:     staleAfter,
+	}, pool, nil, logger)
 
 	var background sync.WaitGroup
-	background.Add(1)
+	background.Add(2)
 	go func() {
 		defer background.Done()
 		logger.Info("worker started", "concurrency", cfg.WorkerConcurrency, "max_retries", cfg.MaxRetries)
 		wrk.Run(ctx)
 	}()
+	go func() {
+		defer background.Done()
+		logger.Info("webhook dispatcher started", "timeout", cfg.WebhookTimeout.String(), "max_retries", cfg.WebhookMaxRetries)
+		dispatcher.Run(ctx)
+	}()
 
 	srv := &http.Server{
 		Addr: cfg.Addr(),
 		Handler: apihttp.NewHandler(apihttp.Deps{
-			Logger: logger,
-			Events: eventSvc,
-			DB:     pool,
+			Logger:   logger,
+			Events:   eventSvc,
+			Webhooks: webhookStore,
+			DB:       pool,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
