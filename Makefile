@@ -21,6 +21,15 @@ test-integration: ## Run all tests including DB integration
 	TEST_DATABASE_URL=$${TEST_DATABASE_URL:-postgres://postgres:postgres@localhost:5432/payments_test?sslmode=disable} \
 		go test -race -count=1 -p 1 ./...
 
+# The race detector needs cgo, which is awkward on Windows. This runs the full
+# suite with -race inside a Linux container against the compose database.
+test-race-docker:
+	docker run --rm -v "$(CURDIR):/src" -w /src \
+		-v pep-gomod:/go/pkg/mod -v pep-gobuild:/root/.cache/go-build \
+		-e CGO_ENABLED=1 \
+		-e TEST_DATABASE_URL=postgres://postgres:postgres@host.docker.internal:5432/payments_test?sslmode=disable \
+		golang:1.27 go test -race -count=1 -p 1 ./...
+
 vet:
 	go vet ./...
 
