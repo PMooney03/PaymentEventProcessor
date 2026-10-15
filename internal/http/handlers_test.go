@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/PMooney03/payment-event-processor/internal/events"
+	"github.com/PMooney03/payment-event-processor/internal/idempotency"
 	"github.com/PMooney03/payment-event-processor/internal/logging"
 )
 
@@ -22,14 +23,20 @@ type fakeEvents struct {
 	mu     sync.Mutex
 	byID   map[uuid.UUID]*events.Event
 	order  []uuid.UUID
+	byKey  map[string]keyRecord
 	failer error // if set, every call returns this error
 }
 
-func newFakeEvents() *fakeEvents {
-	return &fakeEvents{byID: map[uuid.UUID]*events.Event{}}
+type keyRecord struct {
+	hash string
+	id   uuid.UUID
 }
 
-func (f *fakeEvents) Create(_ context.Context, in events.Input) (*events.Event, error) {
+func newFakeEvents() *fakeEvents {
+	return &fakeEvents{byID: map[uuid.UUID]*events.Event{}, byKey: map[string]keyRecord{}}
+}
+
+func (f *fakeEvents) Create(_ context.Context, in events.Input, key string) (*events.CreateResult, error) {
 	if f.failer != nil {
 		return nil, f.failer
 	}
@@ -38,6 +45,17 @@ func (f *fakeEvents) Create(_ context.Context, in events.Input) (*events.Event, 
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	hash, _ := idempotency.HashPayload(in)
+	if key != "" {
+		if rec, ok := f.byKey[key]; ok {
+			if rec.hash != hash {
+				return nil, idempotency.ErrPayloadMismatch
+			}
+			return &events.CreateResult{Event: f.byID[rec.id], Replayed: true}, nil
+		}
+	}
+
 	now := time.Now().UTC()
 	e := &events.Event{
 		ID: uuid.New(), Type: in.Type, PaymentID: in.PaymentID, Amount: in.Amount,
@@ -46,7 +64,19 @@ func (f *fakeEvents) Create(_ context.Context, in events.Input) (*events.Event, 
 	}
 	f.byID[e.ID] = e
 	f.order = append(f.order, e.ID)
-	return e, nil
+	if key != "" {
+		f.byKey[key] = keyRecord{hash: hash, id: e.ID}
+	}
+	return &events.CreateResult{Event: e}, nil
+}
+
+func (f *fakeEvents) mustCreate(t *testing.T, in events.Input) *events.Event {
+	t.Helper()
+	res, err := f.Create(context.Background(), in, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.Event
 }
 
 func (f *fakeEvents) Get(_ context.Context, id uuid.UUID) (*events.Event, error) {
@@ -181,6 +211,53 @@ func TestCreateEventRejectsBadInput(t *testing.T) {
 	}
 }
 
+func TestCreateEventIdempotencyHeader(t *testing.T) {
+	srv := newTestServer(t, newFakeEvents(), okPinger{})
+	hdr := map[string]string{"Idempotency-Key": "key-1"}
+
+	first, b1 := doJSON(t, "POST", srv.URL+"/api/events", validBody, hdr)
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("first: status = %d", first.StatusCode)
+	}
+
+	second, b2 := doJSON(t, "POST", srv.URL+"/api/events", validBody, hdr)
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("replay: status = %d, want 200", second.StatusCode)
+	}
+	if b1["id"] != b2["id"] {
+		t.Errorf("replay returned a different event: %v vs %v", b1["id"], b2["id"])
+	}
+	if second.Header.Get("Idempotent-Replayed") != "true" {
+		t.Error("replay should set Idempotent-Replayed: true")
+	}
+
+	different := strings.Replace(validBody, "4999", "1", 1)
+	third, b3 := doJSON(t, "POST", srv.URL+"/api/events", different, hdr)
+	if third.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("mismatch: status = %d, want 422; body=%v", third.StatusCode, b3)
+	}
+
+	tooLong := map[string]string{"Idempotency-Key": strings.Repeat("k", idempotency.MaxKeyLength+1)}
+	fourth, _ := doJSON(t, "POST", srv.URL+"/api/events", validBody, tooLong)
+	if fourth.StatusCode != http.StatusBadRequest {
+		t.Errorf("oversized key: status = %d, want 400", fourth.StatusCode)
+	}
+}
+
+func TestCreateEventInProgressConflict(t *testing.T) {
+	fake := newFakeEvents()
+	fake.failer = idempotency.ErrInProgress
+	srv := newTestServer(t, fake, okPinger{})
+
+	resp, body := doJSON(t, "POST", srv.URL+"/api/events", validBody, map[string]string{"Idempotency-Key": "k"})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%v", resp.StatusCode, body)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Error("409 should include Retry-After")
+	}
+}
+
 func TestCreateEventOversizedBody(t *testing.T) {
 	srv := newTestServer(t, newFakeEvents(), okPinger{})
 	big := `{"type":"payment.created","payment_id":"` + strings.Repeat("a", maxBodyBytes) + `"}`
@@ -193,7 +270,7 @@ func TestCreateEventOversizedBody(t *testing.T) {
 func TestGetEvent(t *testing.T) {
 	fake := newFakeEvents()
 	srv := newTestServer(t, fake, okPinger{})
-	e, _ := fake.Create(context.Background(), events.Input{
+	e := fake.mustCreate(t, events.Input{
 		Type: "payment.created", PaymentID: "pay_1", Amount: 100, Currency: "USD", CustomerID: "cus_1",
 	})
 
@@ -217,7 +294,7 @@ func TestListEvents(t *testing.T) {
 	fake := newFakeEvents()
 	srv := newTestServer(t, fake, okPinger{})
 	for _, typ := range []string{"payment.created", "payment.refunded", "payment.created"} {
-		_, _ = fake.Create(context.Background(), events.Input{
+		fake.mustCreate(t, events.Input{
 			Type: typ, PaymentID: "pay_1", Amount: 100, Currency: "USD", CustomerID: "cus_1",
 		})
 	}
