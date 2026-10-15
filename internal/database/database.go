@@ -16,6 +16,15 @@ import (
 // Pool is the application's shared connection pool.
 type Pool = pgxpool.Pool
 
+// DB is the subset of pgx operations shared by *pgxpool.Pool and pgx.Tx.
+// Store methods accept a DB so the same query code runs either standalone or
+// as part of a caller-managed transaction.
+type DB interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Connect opens a connection pool and verifies connectivity with a ping.
 // The caller owns the returned pool and must Close it.
 func Connect(ctx context.Context, url string) (*Pool, error) {
