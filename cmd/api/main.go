@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/PMooney03/payment-event-processor/internal/events"
 	apihttp "github.com/PMooney03/payment-event-processor/internal/http"
 	"github.com/PMooney03/payment-event-processor/internal/logging"
+	"github.com/PMooney03/payment-event-processor/internal/worker"
 )
 
 const shutdownTimeout = 15 * time.Second
@@ -47,6 +49,23 @@ func run() error {
 	logger.Info("database connected")
 
 	eventSvc := events.NewService(pool)
+
+	// Background worker: simulated downstream with configurable flakiness.
+	wrk := worker.New(worker.Config{
+		Concurrency:    cfg.WorkerConcurrency,
+		PollInterval:   cfg.WorkerInterval,
+		MaxRetries:     cfg.MaxRetries,
+		RetryBaseDelay: cfg.RetryBaseDelay,
+		StaleAfter:     5 * time.Minute,
+	}, pool, worker.Simulated(cfg.FailureRate, 50*time.Millisecond, 250*time.Millisecond), nil, logger)
+
+	var background sync.WaitGroup
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		logger.Info("worker started", "concurrency", cfg.WorkerConcurrency, "max_retries", cfg.MaxRetries)
+		wrk.Run(ctx)
+	}()
 
 	srv := &http.Server{
 		Addr: cfg.Addr(),
@@ -87,5 +106,17 @@ func run() error {
 		return fmt.Errorf("http shutdown: %w", err)
 	}
 	logger.Info("http server stopped")
+
+	// The worker observes ctx cancellation itself; wait for it to release or
+	// finish any in-flight event, but not forever.
+	stop() // ensure ctx is cancelled even if we got here via serverErr
+	workersDone := make(chan struct{})
+	go func() { background.Wait(); close(workersDone) }()
+	select {
+	case <-workersDone:
+		logger.Info("background workers stopped")
+	case <-shutdownCtx.Done():
+		logger.Warn("background workers did not stop in time")
+	}
 	return nil
 }
